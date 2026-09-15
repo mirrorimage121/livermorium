@@ -1,0 +1,16 @@
+# Музыка и бинарники
+music/
+*.exe
+*.mp3
+*.m4a
+*.opus
+*.wav
+
+# Настройки пользователя
+settings.json
+layout.json
+playlists.json
+
+# Кэш Python
+__pycache__/
+*.pyc
