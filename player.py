@@ -12,7 +12,6 @@ from pywinauto import mouse as win_mouse
 pygame.init()
 
 def _get_base_dir():
-    """Папка рядом с .exe или .py."""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
@@ -55,9 +54,6 @@ WIDTH, HEIGHT = _peek_window_size()
 screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
 pygame.display.set_caption(APP_NAME)
 
-# =========================================================
-#           ПОИСК FFMPEG и YT-DLP
-# =========================================================
 def find_ffmpeg():
     local = os.path.join(BASE_DIR, "ffmpeg.exe")
     if os.path.exists(local):
@@ -511,6 +507,10 @@ progress_lock = threading.Lock()
 tray_icon = None
 app_should_quit = False
 
+# Флаги для запросов из трея (обрабатываются в главном потоке)
+tray_restore_request = False
+tray_hide_request = False
+
 search_open = False
 search_text = ""
 color_picker_target = None
@@ -773,15 +773,9 @@ def make_tray_image():
     return img
 
 def tray_restore(icon, item):
-    try:
-        hwnd = get_hwnd()
-        if hwnd:
-            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(hwnd)
-            pygame.display.set_caption(APP_NAME)
-    except Exception as e:
-        print(f"Ошибка: {e}")
+    """Ставит флаг — обработка в главном потоке."""
+    global tray_restore_request
+    tray_restore_request = True
 
 def tray_quit(icon, item):
     global app_should_quit
@@ -794,12 +788,9 @@ def tray_quit(icon, item):
     pygame.event.post(pygame.event.Event(pygame.QUIT))
 
 def hide_to_tray():
-    try:
-        hwnd = get_hwnd()
-        if hwnd:
-            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
-    except Exception as e:
-        print(f"Ошибка: {e}")
+    """Ставит флаг — обработка в главном потоке."""
+    global tray_hide_request
+    tray_hide_request = True
 
 def start_tray():
     global tray_icon
@@ -808,6 +799,31 @@ def start_tray():
         pystray.MenuItem("Закрыть", tray_quit))
     tray_icon = pystray.Icon(APP_NAME, make_tray_image(), APP_NAME, menu)
     threading.Thread(target=tray_icon.run, daemon=True).start()
+
+def process_tray_requests():
+    """Обработка запросов трея в главном потоке."""
+    global tray_restore_request, tray_hide_request
+    if tray_restore_request:
+        tray_restore_request = False
+        try:
+            hwnd = get_hwnd()
+            if hwnd:
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.SetForegroundWindow(hwnd)
+                pygame.display.set_caption(APP_NAME)
+                print("[tray] Окно восстановлено")
+        except Exception as e:
+            print(f"[tray] Ошибка восстановления: {e}")
+    if tray_hide_request:
+        tray_hide_request = False
+        try:
+            hwnd = get_hwnd()
+            if hwnd:
+                win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+                print("[tray] Окно скрыто")
+        except Exception as e:
+            print(f"[tray] Ошибка скрытия: {e}")
 
 def play_index_by_filename(filename):
     global current_track_index
@@ -1848,6 +1864,9 @@ clock = pygame.time.Clock()
 last_refresh = time.time()
 running = True
 while running:
+    # Обработка запросов из трея в ГЛАВНОМ потоке
+    process_tray_requests()
+
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             if app_should_quit:
