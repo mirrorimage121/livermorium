@@ -6,10 +6,18 @@ from scipy.signal import sosfilt
 import pystray
 from PIL import Image, ImageDraw
 import win32gui, win32con
+import winreg
 from pywinauto import mouse as win_mouse
 
 pygame.init()
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _get_base_dir():
+    """Папка рядом с .exe или .py."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE_DIR = _get_base_dir()
 MUSIC_DIR = os.path.join(BASE_DIR, "music")
 LAYOUT_FILE = os.path.join(BASE_DIR, "layout.json")
 PLAYLISTS_FILE = os.path.join(BASE_DIR, "playlists.json")
@@ -47,17 +55,57 @@ WIDTH, HEIGHT = _peek_window_size()
 screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE)
 pygame.display.set_caption(APP_NAME)
 
-def check_ffmpeg():
+# =========================================================
+#           ПОИСК FFMPEG и YT-DLP
+# =========================================================
+def find_ffmpeg():
+    local = os.path.join(BASE_DIR, "ffmpeg.exe")
+    if os.path.exists(local):
+        return local
     try:
         r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
-            print("[OK] ffmpeg")
+            return "ffmpeg"
+    except Exception:
+        pass
+    return None
+
+def find_ytdlp():
+    local = os.path.join(BASE_DIR, "yt-dlp.exe")
+    if os.path.exists(local):
+        return local
+    return None
+
+FFMPEG_PATH = find_ffmpeg()
+YTDLP_PATH = find_ytdlp()
+
+def check_ffmpeg():
+    if FFMPEG_PATH:
+        print(f"[OK] ffmpeg: {FFMPEG_PATH}")
+        return True
+    print("[!] ffmpeg не найден")
+    return False
+
+def check_ytdlp():
+    if YTDLP_PATH:
+        print(f"[OK] yt-dlp: {YTDLP_PATH}")
+        return True
+    if getattr(sys, 'frozen', False):
+        print("[!] yt-dlp.exe не найден рядом с .exe")
+        return False
+    try:
+        r = subprocess.run([sys.executable, "-m", "yt_dlp", "--version"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            print(f"[OK] yt-dlp: {r.stdout.strip()}")
             return True
     except Exception:
         pass
-    print("[!] ffmpeg не найден")
+    print("[!] yt-dlp не найден")
     return False
+
 FFMPEG_OK = check_ffmpeg()
+YTDLP_OK = check_ytdlp()
 
 def bring_to_front():
     try:
@@ -100,6 +148,47 @@ COLOR_PALETTE = [
 
 background_path = ""
 background_surface = None
+
+AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+def get_startup_command():
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}"'
+    else:
+        script = os.path.abspath(__file__)
+        return f'"{sys.executable}" "{script}"'
+
+def is_autostart_enabled():
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_READ)
+        try:
+            winreg.QueryValueEx(key, APP_NAME)
+            return True
+        except FileNotFoundError:
+            return False
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return False
+
+def set_autostart(enable):
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE)
+        try:
+            if enable:
+                cmd = get_startup_command()
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
+                print(f"[OK] Автозапуск: {cmd}")
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_NAME)
+                    print("[OK] Автозапуск выключен")
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
+    except Exception as e:
+        print(f"Ошибка автозапуска: {e}")
 
 def load_settings():
     defaults = {
@@ -424,9 +513,7 @@ app_should_quit = False
 
 search_open = False
 search_text = ""
-
 color_picker_target = None
-
 transparency_open = False
 transparency_target = "panel"
 dragging_transparency = False
@@ -559,19 +646,41 @@ def download_url(url, target_playlist=None):
         download_active = True
         download_progress = 0.0
         download_status = "Запуск..."
+
     if not FFMPEG_OK:
         with progress_lock:
             download_status = "Нет ffmpeg"
             download_active = False
+        print("[!] ffmpeg не найден")
         return
+
+    if not YTDLP_OK:
+        with progress_lock:
+            download_status = "yt-dlp.exe не найден"
+            download_active = False
+        print("[!] yt-dlp.exe не найден рядом с программой")
+        return
+
     if target_playlist is None:
         target_playlist = parse_playlist_name(url)
+
     before = set(os.listdir(MUSIC_DIR)) if os.path.isdir(MUSIC_DIR) else set()
-    cmd = [sys.executable, "-m", "yt_dlp", "-x", "--audio-format", "mp3",
+
+    if YTDLP_PATH:
+        base_cmd = [YTDLP_PATH]
+    else:
+        base_cmd = [sys.executable, "-m", "yt_dlp"]
+
+    ffmpeg_args = []
+    if FFMPEG_PATH and FFMPEG_PATH != "ffmpeg":
+        ffmpeg_args = ["--ffmpeg-location", os.path.dirname(FFMPEG_PATH)]
+
+    cmd = base_cmd + ["-x", "--audio-format", "mp3",
            "--audio-quality", "5", "--embed-metadata", "--yes-playlist",
-           "--newline", "--no-warnings",
+           "--newline", "--no-warnings"] + ffmpeg_args + [
            "-P", MUSIC_DIR, "-P", f"temp:{MUSIC_DIR}", "-P", f"home:{MUSIC_DIR}",
            "-o", "%(title)s.%(ext)s", url]
+
     print(f"[yt_dlp] {target_playlist}")
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -608,6 +717,7 @@ def download_url(url, target_playlist=None):
     except Exception as e:
         with progress_lock:
             download_status = f"Ошибка: {e}"
+        print(f"[yt_dlp] {e}")
     finally:
         with progress_lock:
             download_active = False
@@ -1143,8 +1253,9 @@ def draw_resize_handle(rect):
 
 def menu_item_rects():
     items = ["ADD", "BACKGROUND", "EDIT", "TRANSPARENCY",
-             "COLOR VIRT", "COLOR PANEL", "COLOR TOP", "COLOR BTN", "RESET", "EXIT"]
-    menu_w = 160
+             "COLOR VIRT", "COLOR PANEL", "COLOR TOP", "COLOR BTN",
+             "AUTOSTART", "RESET", "EXIT"]
+    menu_w = 170
     item_h = 24
     menu_h = item_h * len(items) + 8
     mx = WIDTH - menu_w - PAD
@@ -1173,6 +1284,10 @@ def draw_menu():
             pygame.draw.rect(screen, COLOR_PALETTE[color_top_idx][3], (rect.right - 18, rect.y + 7, 10, 10))
         if item == "COLOR BTN":
             pygame.draw.rect(screen, COLOR_PALETTE[color_btn_idx][2], (rect.right - 18, rect.y + 7, 10, 10))
+        if item == "AUTOSTART":
+            st = "ON" if is_autostart_enabled() else "OFF"
+            st_col = GREEN if st == "ON" else (150, 150, 150)
+            draw_text(st, FONT_SMALL, st_col, rect.right - 32, rect.y + 6)
         draw_text(item, FONT_SMALL, color, rect.x + 8, rect.y + 5)
 
 def color_picker_rects():
@@ -1548,6 +1663,8 @@ def handle_mouse_down(pos, button=1):
             color_picker_target = "top"
         elif item == "COLOR BTN":
             color_picker_target = "btn"
+        elif item == "AUTOSTART":
+            set_autostart(not is_autostart_enabled())
         elif item == "RESET":
             layout.clear()
             layout.update(default_layout(WIDTH, HEIGHT))
